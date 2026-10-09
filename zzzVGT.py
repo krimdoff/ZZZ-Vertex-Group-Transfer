@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZZZ Vertex Group Transfer",
     "author": "ReAgent74",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > ZVGT",
     "description": "Transfer vertex group weights from a source mesh to a target mesh using nearest surface points. The mod was primarily developed for use in ZZZ",
@@ -44,6 +44,15 @@ TEXTS = {
         'error_no_groups': "На исходной модели нет Vertex Groups.",
         'error_no_triangles': "У исходной модели нет треугольников.",
         'error_bvh': "Не удалось построить BVH исходной модели.",
+
+        # --- утилита удаления пустых групп ---
+        'utils_label': "Утилиты",
+        'remove_empty_groups': "Удалить пустые группы",
+        'remove_empty_groups_hint': "Активный объект: {name}",
+        'remove_empty_groups_none': "Активный объект не выбран или не меш.",
+        'report_groups_removed': "Удалено пустых групп: {removed} из {total}",
+        'report_no_groups_to_remove': "На объекте нет Vertex Groups.",
+        'report_no_empty_groups': "Пустых групп не найдено (все {total} используются).",
     },
     'EN': {
         'panel_label': "Transfer weights by nearest surface",
@@ -74,6 +83,15 @@ TEXTS = {
         'error_no_groups': "Source mesh has no Vertex Groups.",
         'error_no_triangles': "Source mesh has no triangles.",
         'error_bvh': "Failed to build BVH for source mesh.",
+
+        # --- utility: remove empty groups ---
+        'utils_label': "Utilities",
+        'remove_empty_groups': "Remove Empty Groups",
+        'remove_empty_groups_hint': "Active object: {name}",
+        'remove_empty_groups_none': "Active object is not selected or not a mesh.",
+        'report_groups_removed': "Removed empty groups: {removed} of {total}",
+        'report_no_groups_to_remove': "Object has no Vertex Groups.",
+        'report_no_empty_groups': "No empty groups found (all {total} are in use).",
     },
 }
 
@@ -145,7 +163,6 @@ def transfer_weights(source, target, epsilon=0.00001, skip_existing=False,
     unmapped_vertices = 0
     distance_skipped = 0
 
-    # Порог включается только если чекбокс взведён и значение > 0
     distance_limit = max_distance if (use_max_distance and max_distance > 0.0) else None
 
     for vertex in dst_mesh.vertices:
@@ -157,7 +174,6 @@ def transfer_weights(source, target, epsilon=0.00001, skip_existing=False,
 
         nearest_point, normal, tri_index, distance = result
 
-        # Отсечение по расстоянию — вершина не получает весов вообще
         if distance_limit is not None and distance > distance_limit:
             distance_skipped += 1
             continue
@@ -223,6 +239,26 @@ def transfer_weights(source, target, epsilon=0.00001, skip_existing=False,
         "target_vertices": len(dst_mesh.vertices),
     }
 
+
+def remove_empty_vertex_groups(obj):
+    """Удаляет все vertex groups объекта, у которых нет ни одной вершины с весом > 0."""
+    used_indices = set()
+    for v in obj.data.vertices:
+        for g in v.groups:
+            if g.weight > 0.0:
+                used_indices.add(g.group)
+
+    total = len(obj.vertex_groups)
+    to_remove_names = [vg.name for vg in obj.vertex_groups if vg.index not in used_indices]
+    for name in to_remove_names:
+        obj.vertex_groups.remove(obj.vertex_groups[name])
+
+    return {
+        "total": total,
+        "removed": len(to_remove_names),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Свойства сцены
 # ---------------------------------------------------------------------------
@@ -275,6 +311,7 @@ class ZZZVGTransferProperties(bpy.types.PropertyGroup):
         default='RU',
     )
 
+
 # ---------------------------------------------------------------------------
 # Операторы
 # ---------------------------------------------------------------------------
@@ -301,6 +338,7 @@ class ZZZVGTRANSFER_OT_use_selection(bpy.types.Operator):
         self.report({'INFO'}, texts['report_info'].format(source=props.source.name, target=props.target.name))
         return {'FINISHED'}
 
+
 class ZZZVGTRANSFER_OT_switch_language(bpy.types.Operator):
     bl_idname = "zzz_vg_transfer.switch_language"
     bl_label = "Switch Language"
@@ -311,6 +349,7 @@ class ZZZVGTRANSFER_OT_switch_language(bpy.types.Operator):
         props = context.scene.zzz_vg_transfer
         props.language = 'EN' if props.language == 'RU' else 'RU'
         return {'FINISHED'}
+
 
 class ZZZVGTRANSFER_OT_transfer(bpy.types.Operator):
     bl_idname = "zzz_vg_transfer.transfer"
@@ -353,6 +392,40 @@ class ZZZVGTRANSFER_OT_transfer(bpy.types.Operator):
             print(f"  {i}: {group.name}")
         return {'FINISHED'}
 
+
+class ZZZVGTRANSFER_OT_remove_empty_groups(bpy.types.Operator):
+    bl_idname = "zzz_vg_transfer.remove_empty_groups"
+    bl_label = "Remove Empty Vertex Groups"
+    bl_description = "Remove all vertex groups of the active mesh that have no vertices with non-zero weights"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.zzz_vg_transfer
+        texts = TEXTS[props.language]
+
+        obj = context.active_object
+        if obj is None or obj.type != 'MESH':
+            self.report({'ERROR'}, texts['remove_empty_groups_none'])
+            return {'CANCELLED'}
+
+        if len(obj.vertex_groups) == 0:
+            self.report({'INFO'}, texts['report_no_groups_to_remove'])
+            return {'FINISHED'}
+
+        stats = remove_empty_vertex_groups(obj)
+        total = stats['total']
+        removed = stats['removed']
+
+        if removed == 0:
+            message = texts['report_no_empty_groups'].format(total=total)
+        else:
+            message = texts['report_groups_removed'].format(removed=removed, total=total)
+
+        self.report({'INFO'}, message)
+        print(f"[ZZZ Vertex Group Transfer] {message}")
+        return {'FINISHED'}
+
+
 # ---------------------------------------------------------------------------
 # Панель
 # ---------------------------------------------------------------------------
@@ -361,7 +434,7 @@ class ZZZVGTRANSFER_PT_panel(bpy.types.Panel):
     bl_idname = "ZZZVGTRANSFER_PT_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "ZZZ Tools"
+    bl_category = "ZVGT"
 
     def draw(self, context):
         layout = self.layout
@@ -379,7 +452,6 @@ class ZZZVGTRANSFER_PT_panel(bpy.types.Panel):
         box.prop(props, "epsilon", text=texts['epsilon_label'])
         box.prop(props, "skip_existing", text=texts['skip_existing_label'])
 
-        # Блок ограничения по расстоянию
         box.separator()
         box.prop(props, "use_max_distance", text=texts['use_max_distance_label'])
         sub = box.row()
@@ -400,6 +472,22 @@ class ZZZVGTRANSFER_PT_panel(bpy.types.Panel):
         row.scale_y = 1.5
         row.operator("zzz_vg_transfer.transfer", text=texts['transfer'], icon='AUTOMERGE_ON')
 
+        # ---- Утилиты ----
+        layout.separator()
+        layout.label(text=texts['utils_label'], icon='TOOL_SETTINGS')
+        utils_box = layout.box()
+
+        active = context.active_object
+        if active is not None and active.type == 'MESH':
+            utils_box.label(text=texts['remove_empty_groups_hint'].format(name=active.name), icon='OBJECT_DATA')
+        else:
+            utils_box.label(text=texts['remove_empty_groups_none'], icon='ERROR')
+
+        row = utils_box.row()
+        row.enabled = (active is not None and active.type == 'MESH')
+        row.operator("zzz_vg_transfer.remove_empty_groups", text=texts['remove_empty_groups'], icon='TRASH')
+
+
 # ---------------------------------------------------------------------------
 # Регистрация
 # ---------------------------------------------------------------------------
@@ -408,19 +496,23 @@ classes = (
     ZZZVGTRANSFER_OT_use_selection,
     ZZZVGTRANSFER_OT_switch_language,
     ZZZVGTRANSFER_OT_transfer,
+    ZZZVGTRANSFER_OT_remove_empty_groups,
     ZZZVGTRANSFER_PT_panel,
 )
+
 
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.zzz_vg_transfer = bpy.props.PointerProperty(type=ZZZVGTransferProperties)
 
+
 def unregister():
     if hasattr(bpy.types.Scene, "zzz_vg_transfer"):
         del bpy.types.Scene.zzz_vg_transfer
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
+
 
 if __name__ == "__main__":
     register()
