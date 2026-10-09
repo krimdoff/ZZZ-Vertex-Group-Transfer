@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZZZ Vertex Group Transfer",
     "author": "ReAgent74",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > ZVGT",
     "description": "Transfer vertex group weights from a source mesh to a target mesh using nearest surface points. The mod was primarily developed for use in ZZZ",
@@ -21,13 +21,15 @@ TEXTS = {
         'target_label': "Новая модель",
         'epsilon_label': "Порог веса",
         'skip_existing_label': "Пропускать существующие группы",
+        'use_max_distance_label': "Ограничивать по расстоянию",
+        'max_distance_label': "Макс. расстояние",
         'use_selection': "Взять выбранные объекты",
         'transfer': "Перенести Vertex Groups",
         'groups_on_target': "Групп на цели сейчас: {count}",
         'will_delete_all': "Все текущие группы цели будут удалены.",
         'will_skip_existing': "Существующие группы цели будут сохранены.",
         'report_info': "Источник: {source}; цель: {target}",
-        'report_done': "Готово: {groups} групп; {assignments} назначений весов; вершин без соответствия: {unmapped}; пропущено групп: {skipped}; порядок: {order}",
+        'report_done': "Готово: {groups} групп; {assignments} назначений весов; без соответствия: {unmapped}; далеко: {distance_skipped}; пропущено групп: {skipped}; порядок: {order}",
         'report_source': "Источник: {source} ({source_verts} вершин)",
         'report_target': "Цель: {target} ({target_verts} вершин)",
         'report_order': "Порядок групп:",
@@ -49,13 +51,15 @@ TEXTS = {
         'target_label': "Target Mesh",
         'epsilon_label': "Weight Threshold",
         'skip_existing_label': "Skip Existing Groups",
+        'use_max_distance_label': "Limit by Distance",
+        'max_distance_label': "Max Distance",
         'use_selection': "Use Selected Objects",
         'transfer': "Transfer Vertex Groups",
         'groups_on_target': "Groups on target now: {count}",
         'will_delete_all': "All current target groups will be deleted.",
         'will_skip_existing': "Existing target groups will be preserved.",
         'report_info': "Source: {source}; target: {target}",
-        'report_done': "Done: {groups} groups; {assignments} weight assignments; unmapped vertices: {unmapped}; skipped groups: {skipped}; order: {order}",
+        'report_done': "Done: {groups} groups; {assignments} weight assignments; unmapped: {unmapped}; too far: {distance_skipped}; skipped groups: {skipped}; order: {order}",
         'report_source': "Source: {source} ({source_verts} vertices)",
         'report_target': "Target: {target} ({target_verts} vertices)",
         'report_order': "Group order:",
@@ -76,7 +80,8 @@ TEXTS = {
 # ---------------------------------------------------------------------------
 # Основная логика переноса
 # ---------------------------------------------------------------------------
-def transfer_weights(source, target, epsilon=0.00001, skip_existing=False, texts=None):
+def transfer_weights(source, target, epsilon=0.00001, skip_existing=False,
+                     use_max_distance=False, max_distance=0.0, texts=None):
     if texts is None:
         texts = TEXTS['EN']
 
@@ -98,7 +103,6 @@ def transfer_weights(source, target, epsilon=0.00001, skip_existing=False, texts
     if not triangles:
         raise ValueError(texts['error_no_triangles'])
 
-    # Мировые координаты, чтобы учитывать трансформации объектов.
     source_coords = [source.matrix_world @ v.co for v in src_mesh.vertices]
     bvh = BVHTree.FromPolygons(source_coords, triangles, all_triangles=True)
     if bvh is None:
@@ -112,7 +116,6 @@ def transfer_weights(source, target, epsilon=0.00001, skip_existing=False, texts
             for assignment in vertex.groups
         })
 
-    # Определяем существующие группы цели, если нужно пропускать.
     existing_names = set()
     if skip_existing:
         existing_names = {g.name for g in target.vertex_groups}
@@ -122,7 +125,6 @@ def transfer_weights(source, target, epsilon=0.00001, skip_existing=False, texts
     skipped_count = 0
 
     if skip_existing:
-        # Сохраняем существующие группы, создаём только новые.
         for idx, src_group in enumerate(source_groups):
             if src_group.name in existing_names:
                 source_to_target[idx] = None
@@ -132,7 +134,6 @@ def transfer_weights(source, target, epsilon=0.00001, skip_existing=False, texts
                 source_to_target[idx] = new_group
                 created_groups.append(new_group)
     else:
-        # Прежнее поведение: удаляем все группы цели и создаём все группы источника.
         for group in list(target.vertex_groups):
             target.vertex_groups.remove(group)
         target_groups = [target.vertex_groups.new(name=g.name) for g in source_groups]
@@ -142,6 +143,10 @@ def transfer_weights(source, target, epsilon=0.00001, skip_existing=False, texts
 
     assignments_count = 0
     unmapped_vertices = 0
+    distance_skipped = 0
+
+    # Порог включается только если чекбокс взведён и значение > 0
+    distance_limit = max_distance if (use_max_distance and max_distance > 0.0) else None
 
     for vertex in dst_mesh.vertices:
         world_pos = target.matrix_world @ vertex.co
@@ -151,6 +156,12 @@ def transfer_weights(source, target, epsilon=0.00001, skip_existing=False, texts
             continue
 
         nearest_point, normal, tri_index, distance = result
+
+        # Отсечение по расстоянию — вершина не получает весов вообще
+        if distance_limit is not None and distance > distance_limit:
+            distance_skipped += 1
+            continue
+
         tri = triangles[tri_index]
         a, b, c = (source_coords[i] for i in tri)
         v0, v1, v2 = b - a, c - a, nearest_point - a
@@ -191,7 +202,6 @@ def transfer_weights(source, target, epsilon=0.00001, skip_existing=False, texts
                 target_group.add([vertex.index], weight, 'REPLACE')
                 assignments_count += 1
 
-    # Проверка порядка групп.
     if skip_existing:
         expected_order = [g.name for g in source_groups if g.name not in existing_names]
         actual_order = [g.name for g in created_groups]
@@ -206,6 +216,7 @@ def transfer_weights(source, target, epsilon=0.00001, skip_existing=False, texts
         "groups": len(created_groups),
         "assignments": assignments_count,
         "unmapped": unmapped_vertices,
+        "distance_skipped": distance_skipped,
         "skipped": skipped_count,
         "order_ok": order_ok,
         "source_vertices": len(src_mesh.vertices),
@@ -240,6 +251,19 @@ class ZZZVGTransferProperties(bpy.types.PropertyGroup):
         name="Skip Existing Groups",
         description="Do not transfer vertex groups whose names already exist on target mesh",
         default=False,
+    )
+    use_max_distance: bpy.props.BoolProperty(
+        name="Limit by Distance",
+        description="Skip target vertices whose nearest point on source is farther than the max distance",
+        default=False,
+    )
+    max_distance: bpy.props.FloatProperty(
+        name="Max Distance",
+        description="Maximum distance (in world units) from a target vertex to the source surface; farther vertices get no weights",
+        default=0.01,
+        min=0.0,
+        max=10.0,
+        precision=4,
     )
     language: bpy.props.EnumProperty(
         name="Language",
@@ -303,6 +327,8 @@ class ZZZVGTRANSFER_OT_transfer(bpy.types.Operator):
                 props.target,
                 props.epsilon,
                 props.skip_existing,
+                props.use_max_distance,
+                props.max_distance,
                 texts
             )
         except Exception as exc:
@@ -313,6 +339,7 @@ class ZZZVGTRANSFER_OT_transfer(bpy.types.Operator):
             groups=result['groups'],
             assignments=result['assignments'],
             unmapped=result['unmapped'],
+            distance_skipped=result['distance_skipped'],
             skipped=result['skipped'],
             order=texts['order_ok'] if result['order_ok'] else texts['order_error']
         )
@@ -341,7 +368,6 @@ class ZZZVGTRANSFER_PT_panel(bpy.types.Panel):
         props = context.scene.zzz_vg_transfer
         texts = TEXTS[props.language]
 
-        # Кнопка смены языка
         row = layout.row()
         switch_text = "English" if props.language == 'RU' else "Русский"
         row.operator("zzz_vg_transfer.switch_language", text=switch_text, icon='WORLD')
@@ -352,6 +378,13 @@ class ZZZVGTRANSFER_PT_panel(bpy.types.Panel):
         box.prop(props, "target", text=texts['target_label'])
         box.prop(props, "epsilon", text=texts['epsilon_label'])
         box.prop(props, "skip_existing", text=texts['skip_existing_label'])
+
+        # Блок ограничения по расстоянию
+        box.separator()
+        box.prop(props, "use_max_distance", text=texts['use_max_distance_label'])
+        sub = box.row()
+        sub.enabled = props.use_max_distance
+        sub.prop(props, "max_distance", text=texts['max_distance_label'])
 
         layout.operator("zzz_vg_transfer.use_selection", text=texts['use_selection'], icon='EYEDROPPER')
         layout.separator()
